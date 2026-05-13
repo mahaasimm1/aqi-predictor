@@ -1,0 +1,31 @@
+# Environment
+.env
+*.env
+
+# Data folders (don't commit raw/processed data)
+data/raw/
+data/processed/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Model files (stored in Hopsworks, not git)
+*.pkl
+*.h5
+*.keras
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# Mac
+.DS_Store
