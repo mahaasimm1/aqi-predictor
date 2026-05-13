@@ -54,7 +54,7 @@ TRAINING_DAYS = 90                    # how many days of history to train on
 MODEL_VERSION = "v1"
 
 # --- Flask ---
-FLASK_PORT = int(os.getenv("FLASK_PORT", 5000))
+FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", 5000)))
 FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
 
 # --- Feature Engineering ---
