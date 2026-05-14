@@ -92,14 +92,39 @@ def predict(artifact, X):
 
 def generate_forecast(artifact, latest_features_df, feature_cols):
     forecasts = []
-    current_features = latest_features_df[feature_cols].values.copy()
+    
+    # Start with the latest feature row
+    current_row = latest_features_df[feature_cols].values[-1:].copy()
+    current_aqi = float(latest_features_df["aqi"].iloc[-1])
+    prev_aqi = current_aqi
 
     for horizon in FORECAST_HOURS:
-        preds = predict(artifact, current_features)
+        # Update lag and rolling features with previous prediction
+        row = current_row.copy()
+        
+        for col in feature_cols:
+            if col == "aqi_lag_1h":
+                idx = feature_cols.index(col)
+                row[0][idx] = prev_aqi
+            elif col == "aqi_lag_2h":
+                idx = feature_cols.index(col)
+                row[0][idx] = current_aqi
+            elif col == "aqi_change_rate":
+                idx = feature_cols.index(col)
+                row[0][idx] = (prev_aqi - current_aqi) / max(current_aqi, 1)
+
+        preds = predict(artifact, row)
+        predicted_aqi = round(float(preds[0]), 2)
+        predicted_aqi = max(0, min(500, predicted_aqi))
+
         forecasts.append({
             "horizon_hours": horizon,
-            "predicted_aqi": round(float(preds[-1]), 2)
+            "predicted_aqi": predicted_aqi
         })
+
+        prev_aqi = current_aqi
+        current_aqi = predicted_aqi
+        current_row = row
 
     return forecasts
 
