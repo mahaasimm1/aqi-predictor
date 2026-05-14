@@ -32,7 +32,7 @@ def predict():
         f["alert"] = f["predicted_aqi"] > AQI_ALERT_THRESHOLD
 
     # SHAP values for latest record
-    _, shap_df = generate_shap_values(artifact, X[-1:], feature_cols)
+    _, shap_df = generate_shap_values(artifact, X[-1:], feature_cols, background_X=X)
     shap_data = shap_df.to_dict(orient="records") if shap_df is not None else []
 
     # Store prediction in MongoDB

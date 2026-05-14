@@ -42,7 +42,7 @@ def load_best_model(db=None):
 
 # Load latest features from MongoDB for inference
 
-def load_latest_features(feature_cols, db=None, n=1):
+def load_latest_features(feature_cols, db=None, n=50):
     if db is None:
         db = get_db()
 
@@ -107,23 +107,29 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
 # Generate SHAP values for the latest prediction
 # Only supported for tree-based and linear models
 
-def generate_shap_values(artifact, X, feature_cols):
+def generate_shap_values(artifact, X, feature_cols, background_X=None):
     model = artifact["model"]
     scaler = artifact["scaler"]
     model_type = type(model).__name__
 
     if scaler is not None:
         X_input = scaler.transform(X)
+        bg_input = scaler.transform(background_X) if background_X is not None else X_input
     else:
         X_input = X
+        bg_input = background_X if background_X is not None else X_input
 
     try:
         if model_type == "RandomForestRegressor":
             explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_input)
+
         elif model_type == "Ridge":
-            explainer = shap.LinearExplainer(model, X_input)
+            if background_X is None:
+                return None, None
+            explainer = shap.LinearExplainer(model, bg_input)
             shap_values = explainer.shap_values(X_input)
+
         else:
             return None, None
 
