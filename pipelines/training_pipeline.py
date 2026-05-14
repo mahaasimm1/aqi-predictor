@@ -50,7 +50,7 @@ def build_features_and_target(df, forecast_horizon=24):
     feature_cols = (
         ["pm2_5", "pm10", "no2", "o3", "co", "so2",
          "temperature", "humidity", "pressure", "wind_speed",
-         "hour", "day_of_week", "month", "is_weekend", "is_peak_hour",
+         "hour", "day_of_week", "month",
          "aqi_change_rate"]
         + [f"aqi_lag_{lag}h" for lag in LAG_HOURS]
         + [f"aqi_rolling_{w}h" for w in ROLLING_WINDOWS]
@@ -81,12 +81,19 @@ def evaluate(y_true, y_pred, model_name):
 # Train Ridge Regression
 
 def train_ridge(X_train, y_train, X_test, y_test):
+    from sklearn.model_selection import GridSearchCV
+
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    model = Ridge(alpha=1.0)
-    model.fit(X_train_scaled, y_train)
+    param_grid = {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]}
+    search = GridSearchCV(Ridge(), param_grid, cv=5,
+                         scoring="neg_root_mean_squared_error")
+    search.fit(X_train_scaled, y_train)
+    model = search.best_estimator_
+    print(f"Best Ridge alpha: {model.alpha}")
+
     preds = model.predict(X_test_scaled)
     metrics = evaluate(y_test, preds, "Ridge")
 
@@ -96,8 +103,27 @@ def train_ridge(X_train, y_train, X_test, y_test):
 # Train Random Forest
 
 def train_random_forest(X_train, y_train, X_test, y_test):
-    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-    model.fit(X_train, y_train)
+    from sklearn.model_selection import RandomizedSearchCV
+
+    param_dist = {
+        "n_estimators": [50, 100, 200],
+        "max_depth": [5, 10, 15, None],
+        "min_samples_split": [5, 10, 20],
+        "min_samples_leaf": [4, 8, 16],
+        "max_features": ["sqrt", "log2"]
+    }
+
+    base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+    search = RandomizedSearchCV(
+        base_model, param_dist,
+        n_iter=20, cv=3,
+        scoring="neg_root_mean_squared_error",
+        random_state=42, n_jobs=-1, verbose=0
+    )
+    search.fit(X_train, y_train)
+    model = search.best_estimator_
+    print(f"Best RF params: {search.best_params_}")
+
     preds = model.predict(X_test)
     metrics = evaluate(y_test, preds, "RandomForest")
 

@@ -86,6 +86,10 @@ def parse_raw_data(pollution_data, weather_data):
 
     # Convert OpenWeather 1-5 AQI to approximate US AQI
     record["aqi"] = convert_to_us_aqi(record["aqi_openweather"], record["pm2_5"])
+    # Cap AQI at 400 and fix data errors where AQI is impossibly high vs PM2.5
+    if record["aqi"] == 500 and record["pm2_5"] < 50:
+        record["aqi"] = convert_to_us_aqi(record["aqi_openweather"], record["pm2_5"])
+        record["aqi"] = min(record["aqi"], int(record["pm2_5"] * 2.5))
 
     return record
 
@@ -121,8 +125,6 @@ def compute_features(record, db):
     record["day_of_week"] = ts.weekday()
     record["day_of_month"] = ts.day
     record["month"] = ts.month
-    record["is_weekend"] = int(ts.weekday() >= 5)
-    record["is_peak_hour"] = int(ts.hour in [7, 8, 9, 17, 18, 19])  # rush hours
 
     # Fetch recent records for lag/rolling features
     collection = db[FEATURES_COLLECTION]

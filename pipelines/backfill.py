@@ -121,8 +121,6 @@ def parse_historical_record(entry, weather_data):
         "day_of_week": dt.weekday(),
         "day_of_month": dt.day,
         "month": dt.month,
-        "is_weekend": int(dt.weekday() >= 5),
-        "is_peak_hour": int(dt.hour in [7, 8, 9, 17, 18, 19]),
         "aqi_category": get_aqi_category(aqi),
     }
 
@@ -136,7 +134,7 @@ def compute_lag_and_rolling(records):
     aqi_series = df["aqi"]
 
     for lag in LAG_HOURS:
-        df[f"aqi_lag_{lag}h"] = aqi_series.shift(lag).fillna(method="bfill")
+        df[f"aqi_lag_{lag}h"] = aqi_series.shift(lag).bfill()
 
     for window in ROLLING_WINDOWS:
         df[f"aqi_rolling_{window}h"] = (
