@@ -3,7 +3,7 @@ pymongo==4.17.0
 dnspython==2.8.0
 requests==2.33.1
 pandas==2.1.4
-numpy==1.24.4
+numpy==1.26.4
 scikit-learn==1.3.0
 tensorflow==2.16.2
 shap==0.49.1
