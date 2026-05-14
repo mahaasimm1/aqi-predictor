@@ -52,5 +52,7 @@ def predict():
         if hasattr(current_timestamp, "isoformat") else str(current_timestamp),
         "forecasts": forecasts,
         "shap_importance": shap_data,
-        "alert": current_aqi > AQI_ALERT_THRESHOLD
+        "alert": current_aqi > AQI_ALERT_THRESHOLD,
+        "model_type": model_doc.get("model_type", "unknown")
+
     })

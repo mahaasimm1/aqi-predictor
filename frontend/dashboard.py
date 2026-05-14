@@ -100,4 +100,4 @@ else:
     st.info("No historical data available.")
 
 st.markdown("---")
-st.caption("Data source: OpenWeatherMap API | Model: Ridge Regression | Store: MongoDB Atlas")
+st.caption(f"Data source: OpenWeatherMap API | Model: {predict_data.get('model_type', 'Random Forest').replace('_', ' ').title()} | Store: MongoDB Atlas")
