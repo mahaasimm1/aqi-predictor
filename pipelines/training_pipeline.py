@@ -17,7 +17,10 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
-
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+import warnings
+warnings.filterwarnings("ignore")
 from config.settings import (
     MONGO_URI, MONGO_DB_NAME, FEATURES_COLLECTION,
     MODELS_COLLECTION, METRICS_COLLECTION,
@@ -169,6 +172,34 @@ def train_lstm(X_train, y_train, X_test, y_test):
 
     return {"model": model, "scaler": scaler, "metrics": metrics, "name": "lstm"}
 
+def train_arima(df, y_test_size=0.2):
+    # ARIMA works on the raw AQI time series, not the feature matrix
+    aqi_series = df["aqi"].dropna().values
+    split = int(len(aqi_series) * (1 - y_test_size))
+    train_series = aqi_series[:split]
+    test_series = aqi_series[split:]
+
+    # Check stationarity
+    adf_result = adfuller(train_series)
+    print(f"ADF Statistic: {adf_result[0]:.4f} | p-value: {adf_result[1]:.4f}")
+    d = 0 if adf_result[1] < 0.05 else 1
+
+    # Fit ARIMA(p=5, d=d, q=0)
+    print("Fitting ARIMA model...")
+    model = ARIMA(train_series, order=(5, d, 0))
+    fitted = model.fit()
+
+    # Forecast
+    forecast = fitted.forecast(steps=len(test_series))
+    metrics = evaluate(test_series, forecast, "ARIMA")
+
+    return {
+        "model": fitted,
+        "scaler": None,
+        "metrics": metrics,
+        "name": "arima",
+        "is_arima": True
+    }
 
 # Save the best model to MongoDB GridFS as a pickle file
 # Also store metadata in the models collection
@@ -179,7 +210,8 @@ def save_model(best, feature_cols, db):
     artifact = {
         "model": best["model"],
         "scaler": best["scaler"],
-        "feature_cols": feature_cols
+        "feature_cols": feature_cols,
+        "is_arima": best.get("is_arima", False)
     }
 
     model_bytes = pickle.dumps(artifact)
@@ -256,8 +288,9 @@ def run_training_pipeline():
     ridge_result = train_ridge(X_train, y_train, X_test, y_test)
     rf_result = train_random_forest(X_train, y_train, X_test, y_test)
     lstm_result = train_lstm(X_train, y_train, X_test, y_test)
+    arima_result = train_arima(df)
 
-    results = [ridge_result, rf_result, lstm_result]
+    results = [ridge_result, rf_result, lstm_result, arima_result]
 
     # Pick best model by lowest RMSE
     best = min(results, key=lambda r: r["metrics"]["rmse"])
