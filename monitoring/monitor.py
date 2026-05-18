@@ -116,7 +116,16 @@ def run_monitoring():
     y_pred, y_actual = load_prediction_vs_actual(db)
 
     if not y_pred:
-        print("Not enough matched prediction/actual pairs.")
+        print("Not enough matched pairs — logging empty run.")
+        db[MONITORING_COLLECTION].insert_one({
+            "timestamp": datetime.now(timezone.utc),
+            "mae": None,
+            "rmse": None,
+            "drift_ratio": None,
+            "drift_detected": False,
+            "sample_size": 0,
+            "note": "insufficient matched pairs"
+        })
         return
 
     metrics = compute_drift_metrics(y_pred, y_actual)

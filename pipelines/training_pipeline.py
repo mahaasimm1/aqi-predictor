@@ -298,6 +298,13 @@ def run_training_pipeline():
 
     save_model(best, feature_cols, db)
     log_metrics(results, db)
+    # Update trained_at for all models
+    for result in results:
+        if not result.get("is_arima"):
+            db[MODELS_COLLECTION].update_one(
+                {"name": f"aqi_{result['name']}_model"},
+                {"$set": {"trained_at": datetime.now(timezone.utc), "metrics": result["metrics"]}}
+            )
 
     print("Training pipeline complete.")
 
