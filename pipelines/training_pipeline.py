@@ -90,7 +90,11 @@ def train_ridge(X_train, y_train, X_test, y_test):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    param_grid = {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]}
+    # Clip extreme scaled values
+    X_train_scaled = np.clip(X_train_scaled, -10, 10)
+    X_test_scaled = np.clip(X_test_scaled, -10, 10)
+
+    param_grid = {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]}
     search = GridSearchCV(Ridge(), param_grid, cv=5,
                          scoring="neg_root_mean_squared_error")
     search.fit(X_train_scaled, y_train)
@@ -98,6 +102,7 @@ def train_ridge(X_train, y_train, X_test, y_test):
     print(f"Best Ridge alpha: {model.alpha}")
 
     preds = model.predict(X_test_scaled)
+    preds = np.clip(preds, 0, 500)
     metrics = evaluate(y_test, preds, "Ridge")
 
     return {"model": model, "scaler": scaler, "metrics": metrics, "name": "ridge"}
