@@ -170,18 +170,9 @@ def generate_shap_values(artifact, X, feature_cols, background_X=None):
         bg_input = background_X if background_X is not None else X_input
 
     try:
-        if model_type == "RandomForestRegressor":
+        if model_type in ["RandomForestRegressor", "XGBRegressor", "GradientBoostingRegressor"]:
             explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_input)
-
-        elif model_type == "Ridge":
-            if background_X is None:
-                return None, None
-            explainer = shap.LinearExplainer(model, bg_input)
-            shap_values = explainer.shap_values(X_input)
-
-        else:
-            return None, None
 
         shap_df = pd.DataFrame({
             "feature": feature_cols,
