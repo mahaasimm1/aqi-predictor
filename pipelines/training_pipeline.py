@@ -5,26 +5,26 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pickle
 import numpy as np
 import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
 from datetime import datetime, timezone
 from pymongo import MongoClient
 import gridfs
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from xgboost import XGBRegressor
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import adfuller
-import warnings
-warnings.filterwarnings("ignore")
+
 from config.settings import (
     MONGO_URI, MONGO_DB_NAME, FEATURES_COLLECTION,
     MODELS_COLLECTION, METRICS_COLLECTION,
-    LAG_HOURS, ROLLING_WINDOWS, FORECAST_HOURS, LOOKBACK_HOURS
+    LAG_HOURS, ROLLING_WINDOWS, FORECAST_HOURS
 )
 
 
@@ -35,7 +35,7 @@ def get_db():
     return client[MONGO_DB_NAME]
 
 
-# Load features from MongoDB and return as a sorted DataFrame
+# Load features from MongoDB
 
 def load_features(db):
     collection = db[FEATURES_COLLECTION]
@@ -46,32 +46,30 @@ def load_features(db):
     return df
 
 
-# Build feature matrix X and target vector y
-# Target is AQI shifted 24 hours forward (next day prediction)
+# Build feature matrix and target
 
-def build_features_and_target(df, forecast_horizon=24):
+def build_features_and_target(df, forecast_horizon=1):
     feature_cols = (
         ["pm2_5", "pm10", "no2", "o3", "co", "so2",
          "temperature", "humidity", "pressure", "wind_speed",
-         "hour", "day_of_week", "month",
-         "aqi_change_rate"]
+         "hour", "day_of_week", "month", "aqi_change_rate"]
         + [f"aqi_lag_{lag}h" for lag in LAG_HOURS]
         + [f"aqi_rolling_{w}h" for w in ROLLING_WINDOWS]
     )
 
-    # Only keep columns that actually exist in the dataframe
     feature_cols = [c for c in feature_cols if c in df.columns]
 
+    # Single target: AQI forecast_horizon hours ahead
     df["target"] = df["aqi"].shift(-forecast_horizon)
     df = df.dropna(subset=["target"] + feature_cols)
 
     X = df[feature_cols].values
-    y = df["target"].values
+    y = df["target"].values  # 1D array
 
     return X, y, feature_cols
 
 
-# Evaluate predictions and return metrics dict
+# Evaluate predictions
 
 def evaluate(y_true, y_pred, model_name):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -84,13 +82,10 @@ def evaluate(y_true, y_pred, model_name):
 # Train Ridge Regression
 
 def train_ridge(X_train, y_train, X_test, y_test):
-    from sklearn.model_selection import GridSearchCV
-
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Clip extreme scaled values
     X_train_scaled = np.clip(X_train_scaled, -10, 10)
     X_test_scaled = np.clip(X_test_scaled, -10, 10)
 
@@ -111,8 +106,6 @@ def train_ridge(X_train, y_train, X_test, y_test):
 # Train Random Forest
 
 def train_random_forest(X_train, y_train, X_test, y_test):
-    from sklearn.model_selection import RandomizedSearchCV
-
     param_dist = {
         "n_estimators": [50, 100, 200],
         "max_depth": [5, 10, 15, None],
@@ -133,21 +126,81 @@ def train_random_forest(X_train, y_train, X_test, y_test):
     print(f"Best RF params: {search.best_params_}")
 
     preds = model.predict(X_test)
+    preds = np.clip(preds, 0, 500)
     metrics = evaluate(y_test, preds, "RandomForest")
 
     return {"model": model, "scaler": None, "metrics": metrics, "name": "random_forest"}
 
 
+# Train Gradient Boosting
+
+def train_gradient_boosting(X_train, y_train, X_test, y_test):
+    param_dist = {
+        "n_estimators": [100, 200, 300],
+        "max_depth": [3, 4, 5],
+        "learning_rate": [0.05, 0.1, 0.2],
+        "min_samples_split": [5, 10],
+        "subsample": [0.8, 1.0]
+    }
+
+    base_model = GradientBoostingRegressor(random_state=42)
+    search = RandomizedSearchCV(
+        base_model, param_dist,
+        n_iter=20, cv=3,
+        scoring="neg_root_mean_squared_error",
+        random_state=42, n_jobs=-1, verbose=0
+    )
+    search.fit(X_train, y_train)
+    model = search.best_estimator_
+    print(f"Best GB params: {search.best_params_}")
+
+    preds = model.predict(X_test)
+    preds = np.clip(preds, 0, 500)
+    metrics = evaluate(y_test, preds, "GradientBoosting")
+
+    return {"model": model, "scaler": None, "metrics": metrics, "name": "gradient_boosting"}
+
+
+# Train XGBoost
+
+def train_xgboost(X_train, y_train, X_test, y_test):
+    param_dist = {
+        "n_estimators": [200, 300, 500],
+        "max_depth": [3, 4, 5],
+        "learning_rate": [0.01, 0.05, 0.1],
+        "subsample": [0.7, 0.8, 0.9],
+        "colsample_bytree": [0.7, 0.8, 0.9],
+        "min_child_weight": [3, 5, 7],
+        "gamma": [0, 0.1, 0.2],
+        "reg_alpha": [0, 0.1, 1.0],
+        "reg_lambda": [1.0, 2.0, 5.0]
+    }
+
+    base_model = XGBRegressor(random_state=42, verbosity=0)
+    search = RandomizedSearchCV(
+        base_model, param_dist,
+        n_iter=30, cv=3,
+        scoring="neg_root_mean_squared_error",
+        random_state=42, n_jobs=-1, verbose=0
+    )
+    search.fit(X_train, y_train)
+    model = search.best_estimator_
+    print(f"Best XGB params: {search.best_params_}")
+
+    preds = model.predict(X_test)
+    preds = np.clip(preds, 0, 500)
+    metrics = evaluate(y_test, preds, "XGBoost")
+
+    return {"model": model, "scaler": None, "metrics": metrics, "name": "xgboost"}
+
+
 # Train LSTM
-# Reshapes data into sequences of LOOKBACK_HOURS timesteps
 
 def train_lstm(X_train, y_train, X_test, y_test):
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Reshape to (samples, timesteps, features)
-    # For simplicity each sample is treated as 1 timestep
     X_train_r = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
     X_test_r = X_test_scaled.reshape((X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
 
@@ -173,41 +226,13 @@ def train_lstm(X_train, y_train, X_test, y_test):
     )
 
     preds = model.predict(X_test_r).flatten()
+    preds = np.clip(preds, 0, 500)
     metrics = evaluate(y_test, preds, "LSTM")
 
     return {"model": model, "scaler": scaler, "metrics": metrics, "name": "lstm"}
 
-def train_arima(df, y_test_size=0.2):
-    # ARIMA works on the raw AQI time series, not the feature matrix
-    aqi_series = df["aqi"].dropna().values
-    split = int(len(aqi_series) * (1 - y_test_size))
-    train_series = aqi_series[:split]
-    test_series = aqi_series[split:]
 
-    # Check stationarity
-    adf_result = adfuller(train_series)
-    print(f"ADF Statistic: {adf_result[0]:.4f} | p-value: {adf_result[1]:.4f}")
-    d = 0 if adf_result[1] < 0.05 else 1
-
-    # Fit ARIMA(p=5, d=d, q=0)
-    print("Fitting ARIMA model...")
-    model = ARIMA(train_series, order=(5, d, 0))
-    fitted = model.fit()
-
-    # Forecast
-    forecast = fitted.forecast(steps=len(test_series))
-    metrics = evaluate(test_series, forecast, "ARIMA")
-
-    return {
-        "model": fitted,
-        "scaler": None,
-        "metrics": metrics,
-        "name": "arima",
-        "is_arima": True
-    }
-
-# Save the best model to MongoDB GridFS as a pickle file
-# Also store metadata in the models collection
+# Save best model to MongoDB GridFS
 
 def save_model(best, feature_cols, db):
     fs = gridfs.GridFS(db)
@@ -216,13 +241,12 @@ def save_model(best, feature_cols, db):
         "model": best["model"],
         "scaler": best["scaler"],
         "feature_cols": feature_cols,
-        "is_arima": best.get("is_arima", False)
+        "is_arima": False
     }
 
     model_bytes = pickle.dumps(artifact)
     model_name = f"aqi_{best['name']}_model"
 
-    # Remove old version if exists
     old = db[MODELS_COLLECTION].find_one({"name": model_name})
     if old and "gridfs_id" in old:
         try:
@@ -246,7 +270,6 @@ def save_model(best, feature_cols, db):
         upsert=True
     )
 
-    # Mark all others as not best
     db[MODELS_COLLECTION].update_many(
         {"name": {"$ne": model_name}},
         {"$set": {"is_best": False}}
@@ -255,12 +278,11 @@ def save_model(best, feature_cols, db):
     print(f"Saved best model: {model_name}")
 
 
-# Log metrics for all models to the metrics collection
+# Log metrics for all models
 
 def log_metrics(results, db):
     collection = db[METRICS_COLLECTION]
     timestamp = datetime.now(timezone.utc)
-
     for result in results:
         collection.insert_one({
             "model_name": result["name"],
@@ -281,7 +303,7 @@ def run_training_pipeline():
         print("Not enough data to train. Run backfill first.")
         return
 
-    X, y, feature_cols = build_features_and_target(df)
+    X, y, feature_cols = build_features_and_target(df, forecast_horizon=1)
     print(f"Feature matrix: {X.shape} | Target: {y.shape}")
     print(f"Features used: {feature_cols}")
 
@@ -292,24 +314,27 @@ def run_training_pipeline():
     print("\nTraining models...")
     ridge_result = train_ridge(X_train, y_train, X_test, y_test)
     rf_result = train_random_forest(X_train, y_train, X_test, y_test)
+    gb_result = train_gradient_boosting(X_train, y_train, X_test, y_test)
+    xgb_result = train_xgboost(X_train, y_train, X_test, y_test)
     lstm_result = train_lstm(X_train, y_train, X_test, y_test)
-    arima_result = train_arima(df)
 
-    results = [ridge_result, rf_result, lstm_result, arima_result]
+    results = [ridge_result, rf_result, gb_result, xgb_result, lstm_result]
 
-    # Pick best model by lowest RMSE
     best = min(results, key=lambda r: r["metrics"]["rmse"])
     print(f"\nBest model: {best['name']} (RMSE: {best['metrics']['rmse']})")
 
     save_model(best, feature_cols, db)
     log_metrics(results, db)
-    # Update trained_at for all models
+
     for result in results:
-        if not result.get("is_arima"):
-            db[MODELS_COLLECTION].update_one(
-                {"name": f"aqi_{result['name']}_model"},
-                {"$set": {"trained_at": datetime.now(timezone.utc), "metrics": result["metrics"]}}
-            )
+        db[MODELS_COLLECTION].update_one(
+            {"name": f"aqi_{result['name']}_model"},
+            {"$set": {
+                "trained_at": datetime.now(timezone.utc),
+                "metrics": result["metrics"]
+            }},
+            upsert=True
+        )
 
     print("Training pipeline complete.")
 

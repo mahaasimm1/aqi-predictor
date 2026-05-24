@@ -92,26 +92,51 @@ def predict(artifact, X):
 
 def generate_forecast(artifact, latest_features_df, feature_cols):
     forecasts = []
-    
-    # Start with the latest feature row
     current_row = latest_features_df[feature_cols].values[-1:].copy()
     current_aqi = float(latest_features_df["aqi"].iloc[-1])
     prev_aqi = current_aqi
+    aqi_history = list(latest_features_df["aqi"].values[-24:])
 
     for horizon in FORECAST_HOURS:
-        # Update lag and rolling features with previous prediction
         row = current_row.copy()
-        
+
+        # Update lag features with recent predictions
         for col in feature_cols:
-            if col == "aqi_lag_1h":
-                idx = feature_cols.index(col)
-                row[0][idx] = prev_aqi
-            elif col == "aqi_lag_2h":
-                idx = feature_cols.index(col)
-                row[0][idx] = current_aqi
+            idx = feature_cols.index(col)
+            if col == "aqi_lag_1h" and len(aqi_history) >= 1:
+                row[0][idx] = aqi_history[-1]
+            elif col == "aqi_lag_2h" and len(aqi_history) >= 2:
+                row[0][idx] = aqi_history[-2]
+            elif col == "aqi_lag_3h" and len(aqi_history) >= 3:
+                row[0][idx] = aqi_history[-3]
+            elif col == "aqi_lag_6h" and len(aqi_history) >= 6:
+                row[0][idx] = aqi_history[-6]
+            elif col == "aqi_lag_12h" and len(aqi_history) >= 12:
+                row[0][idx] = aqi_history[-12]
+            elif col == "aqi_lag_24h" and len(aqi_history) >= 24:
+                row[0][idx] = aqi_history[-24]
+            elif col == "aqi_rolling_3h" and len(aqi_history) >= 3:
+                row[0][idx] = round(sum(aqi_history[-3:]) / 3, 2)
+            elif col == "aqi_rolling_6h" and len(aqi_history) >= 6:
+                row[0][idx] = round(sum(aqi_history[-6:]) / 6, 2)
+            elif col == "aqi_rolling_12h" and len(aqi_history) >= 12:
+                row[0][idx] = round(sum(aqi_history[-12:]) / 12, 2)
+            elif col == "aqi_rolling_24h" and len(aqi_history) >= 24:
+                row[0][idx] = round(sum(aqi_history[-24:]) / 24, 2)
             elif col == "aqi_change_rate":
-                idx = feature_cols.index(col)
-                row[0][idx] = (prev_aqi - current_aqi) / max(current_aqi, 1)
+                row[0][idx] = round((aqi_history[-1] - prev_aqi) / max(prev_aqi, 1), 4)
+            elif col == "hour":
+                from datetime import datetime, timezone, timedelta
+                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
+                row[0][idx] = future_time.hour
+            elif col == "day_of_week":
+                from datetime import datetime, timezone, timedelta
+                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
+                row[0][idx] = future_time.weekday()
+            elif col == "month":
+                from datetime import datetime, timezone, timedelta
+                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
+                row[0][idx] = future_time.month
 
         preds = predict(artifact, row)
         predicted_aqi = round(float(preds[0]), 2)
@@ -122,8 +147,8 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
             "predicted_aqi": predicted_aqi
         })
 
-        prev_aqi = current_aqi
-        current_aqi = predicted_aqi
+        prev_aqi = aqi_history[-1]
+        aqi_history.append(predicted_aqi)
         current_row = row
 
     return forecasts

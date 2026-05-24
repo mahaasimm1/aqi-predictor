@@ -8,12 +8,12 @@ CITY = os.getenv("CITY", "karachi")
 LAT = float(os.getenv("LAT", 24.8607))
 LON = float(os.getenv("LON", 67.0011))
 
-# --- OpenWeather API ---
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-OPENWEATHER_BASE_URL = "http://api.openweathermap.org/data/2.5"
-AIR_POLLUTION_URL = f"{OPENWEATHER_BASE_URL}/air_pollution"
-AIR_POLLUTION_HISTORY_URL = f"{OPENWEATHER_BASE_URL}/air_pollution/history"
-WEATHER_URL = f"{OPENWEATHER_BASE_URL}/weather"
+# Open-Meteo API (no key required)
+OPENMETEO_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+OPENMETEO_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+AIR_QUALITY_PARAMS = "pm2_5,pm10,nitrogen_dioxide,ozone,carbon_monoxide,sulphur_dioxide,us_aqi"
+WEATHER_PARAMS = "temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,visibility"
 
 # --- MongoDB ---
 MONGO_URI = os.getenv("MONGO_URI")
@@ -48,7 +48,7 @@ AQI_COLORS = {
 }
 
 # --- Model Settings ---
-FORECAST_HOURS = [24, 48, 72]        # predict AQI 1, 2, 3 days ahead
+FORECAST_HOURS = list(range(1, 73))  # 1 to 72 hours
 LOOKBACK_HOURS = 24                   # how many past hours to use as features
 TRAINING_DAYS = 90                    # how many days of history to train on
 MODEL_VERSION = "v1"
