@@ -91,19 +91,35 @@ def predict(artifact, X):
 # Each step uses the previous prediction as the new lag feature
 
 def generate_forecast(artifact, latest_features_df, feature_cols):
+    from datetime import datetime, timezone, timedelta
+
     forecasts = []
     current_row = latest_features_df[feature_cols].values[-1:].copy()
     current_aqi = float(latest_features_df["aqi"].iloc[-1])
-    prev_aqi = current_aqi
     aqi_history = list(latest_features_df["aqi"].values[-24:])
+
+    # Get base timestamp
+    try:
+        base_time = pd.to_datetime(latest_features_df["timestamp"].iloc[-1])
+        if base_time.tzinfo is None:
+            base_time = base_time.replace(tzinfo=timezone.utc)
+    except Exception:
+        base_time = datetime.now(timezone.utc)
 
     for horizon in FORECAST_HOURS:
         row = current_row.copy()
+        future_time = base_time + timedelta(hours=horizon)
 
-        # Update lag features with recent predictions
         for col in feature_cols:
             idx = feature_cols.index(col)
-            if col == "aqi_lag_1h" and len(aqi_history) >= 1:
+
+            if col == "hour":
+                row[0][idx] = future_time.hour
+            elif col == "day_of_week":
+                row[0][idx] = future_time.weekday()
+            elif col == "month":
+                row[0][idx] = future_time.month
+            elif col == "aqi_lag_1h" and len(aqi_history) >= 1:
                 row[0][idx] = aqi_history[-1]
             elif col == "aqi_lag_2h" and len(aqi_history) >= 2:
                 row[0][idx] = aqi_history[-2]
@@ -123,20 +139,10 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
                 row[0][idx] = round(sum(aqi_history[-12:]) / 12, 2)
             elif col == "aqi_rolling_24h" and len(aqi_history) >= 24:
                 row[0][idx] = round(sum(aqi_history[-24:]) / 24, 2)
-            elif col == "aqi_change_rate":
-                row[0][idx] = round((aqi_history[-1] - prev_aqi) / max(prev_aqi, 1), 4)
-            elif col == "hour":
-                from datetime import datetime, timezone, timedelta
-                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
-                row[0][idx] = future_time.hour
-            elif col == "day_of_week":
-                from datetime import datetime, timezone, timedelta
-                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
-                row[0][idx] = future_time.weekday()
-            elif col == "month":
-                from datetime import datetime, timezone, timedelta
-                future_time = datetime.now(timezone.utc) + timedelta(hours=horizon)
-                row[0][idx] = future_time.month
+            elif col == "aqi_change_rate" and len(aqi_history) >= 2:
+                prev = aqi_history[-2] if len(aqi_history) >= 2 else aqi_history[-1]
+                curr = aqi_history[-1]
+                row[0][idx] = round((curr - prev) / max(prev, 1), 4)
 
         preds = predict(artifact, row)
         predicted_aqi = round(float(preds[0]), 2)
@@ -147,8 +153,10 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
             "predicted_aqi": predicted_aqi
         })
 
-        prev_aqi = aqi_history[-1]
         aqi_history.append(predicted_aqi)
+        if len(aqi_history) > 24:
+            aqi_history = aqi_history[-24:]
+
         current_row = row
 
     return forecasts
