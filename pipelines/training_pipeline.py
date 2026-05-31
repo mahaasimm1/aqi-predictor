@@ -24,18 +24,19 @@ from tensorflow.keras.callbacks import EarlyStopping
 from config.settings import (
     MONGO_URI, MONGO_DB_NAME, FEATURES_COLLECTION,
     MODELS_COLLECTION, METRICS_COLLECTION,
-    LAG_HOURS, ROLLING_WINDOWS, FORECAST_HOURS
+    LAG_HOURS, ROLLING_WINDOWS
 )
 
+# The model predicts AQI 1 hour ahead.
+# At inference time we call it iteratively for each future hour,
+# updating lag/rolling features and forecasted weather each step.
+FORECAST_HORIZON = 1
 
-# MongoDB connection
 
 def get_db():
     client = MongoClient(MONGO_URI)
     return client[MONGO_DB_NAME]
 
-
-# Load features from MongoDB
 
 def load_features(db):
     collection = db[FEATURES_COLLECTION]
@@ -46,9 +47,16 @@ def load_features(db):
     return df
 
 
-# Build feature matrix and target
+def build_features_and_target(df):
+    """
+    Build X and y where:
+      - X at row i = all features observed at time T
+      - y at row i = AQI at time T + 1h  (1-step-ahead target)
 
-def build_features_and_target(df, forecast_horizon=1):
+    Weather features (pm2_5, temperature, etc.) are the CURRENT observed values.
+    At inference time we replace them with Open-Meteo 3-day forecasts.
+    Lag/rolling features summarise recent AQI history seen at time T.
+    """
     feature_cols = (
         ["pm2_5", "pm10", "no2", "o3", "co", "so2",
          "temperature", "humidity", "pressure", "wind_speed",
@@ -59,17 +67,16 @@ def build_features_and_target(df, forecast_horizon=1):
 
     feature_cols = [c for c in feature_cols if c in df.columns]
 
-    # Single target: AQI forecast_horizon hours ahead
-    df["target"] = df["aqi"].shift(-forecast_horizon)
-    df = df.dropna(subset=["target"] + feature_cols)
+    # Target: AQI one hour later
+    df = df.copy()
+    df["target"] = df["aqi"].shift(-FORECAST_HORIZON)
+    df = df.dropna(subset=["target"] + feature_cols).reset_index(drop=True)
 
     X = df[feature_cols].values
-    y = df["target"].values  # 1D array
+    y = df["target"].values
 
     return X, y, feature_cols
 
-
-# Evaluate predictions
 
 def evaluate(y_true, y_pred, model_name):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -79,31 +86,24 @@ def evaluate(y_true, y_pred, model_name):
     return {"rmse": round(rmse, 4), "mae": round(mae, 4), "r2": round(r2, 4)}
 
 
-# Train Ridge Regression
-
 def train_ridge(X_train, y_train, X_test, y_test):
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    X_train_scaled = np.clip(X_train_scaled, -10, 10)
-    X_test_scaled = np.clip(X_test_scaled, -10, 10)
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+    X_train_s = np.clip(X_train_s, -10, 10)
+    X_test_s = np.clip(X_test_s, -10, 10)
 
     param_grid = {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]}
     search = GridSearchCV(Ridge(), param_grid, cv=5,
-                         scoring="neg_root_mean_squared_error")
-    search.fit(X_train_scaled, y_train)
+                          scoring="neg_root_mean_squared_error")
+    search.fit(X_train_s, y_train)
     model = search.best_estimator_
     print(f"Best Ridge alpha: {model.alpha}")
 
-    preds = model.predict(X_test_scaled)
-    preds = np.clip(preds, 0, 500)
+    preds = np.clip(model.predict(X_test_s), 0, 500)
     metrics = evaluate(y_test, preds, "Ridge")
-
     return {"model": model, "scaler": scaler, "metrics": metrics, "name": "ridge"}
 
-
-# Train Random Forest
 
 def train_random_forest(X_train, y_train, X_test, y_test):
     param_dist = {
@@ -113,11 +113,9 @@ def train_random_forest(X_train, y_train, X_test, y_test):
         "min_samples_leaf": [4, 8, 16],
         "max_features": ["sqrt", "log2"]
     }
-
-    base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
     search = RandomizedSearchCV(
-        base_model, param_dist,
-        n_iter=20, cv=3,
+        RandomForestRegressor(random_state=42, n_jobs=-1),
+        param_dist, n_iter=20, cv=3,
         scoring="neg_root_mean_squared_error",
         random_state=42, n_jobs=-1, verbose=0
     )
@@ -125,14 +123,10 @@ def train_random_forest(X_train, y_train, X_test, y_test):
     model = search.best_estimator_
     print(f"Best RF params: {search.best_params_}")
 
-    preds = model.predict(X_test)
-    preds = np.clip(preds, 0, 500)
+    preds = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "RandomForest")
-
     return {"model": model, "scaler": None, "metrics": metrics, "name": "random_forest"}
 
-
-# Train Gradient Boosting
 
 def train_gradient_boosting(X_train, y_train, X_test, y_test):
     param_dist = {
@@ -142,11 +136,9 @@ def train_gradient_boosting(X_train, y_train, X_test, y_test):
         "min_samples_split": [5, 10],
         "subsample": [0.8, 1.0]
     }
-
-    base_model = GradientBoostingRegressor(random_state=42)
     search = RandomizedSearchCV(
-        base_model, param_dist,
-        n_iter=20, cv=3,
+        GradientBoostingRegressor(random_state=42),
+        param_dist, n_iter=20, cv=3,
         scoring="neg_root_mean_squared_error",
         random_state=42, n_jobs=-1, verbose=0
     )
@@ -154,14 +146,10 @@ def train_gradient_boosting(X_train, y_train, X_test, y_test):
     model = search.best_estimator_
     print(f"Best GB params: {search.best_params_}")
 
-    preds = model.predict(X_test)
-    preds = np.clip(preds, 0, 500)
+    preds = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "GradientBoosting")
-
     return {"model": model, "scaler": None, "metrics": metrics, "name": "gradient_boosting"}
 
-
-# Train XGBoost
 
 def train_xgboost(X_train, y_train, X_test, y_test):
     param_dist = {
@@ -175,11 +163,9 @@ def train_xgboost(X_train, y_train, X_test, y_test):
         "reg_alpha": [0, 0.1, 1.0],
         "reg_lambda": [1.0, 2.0, 5.0]
     }
-
-    base_model = XGBRegressor(random_state=42, verbosity=0)
     search = RandomizedSearchCV(
-        base_model, param_dist,
-        n_iter=30, cv=3,
+        XGBRegressor(random_state=42, verbosity=0),
+        param_dist, n_iter=30, cv=3,
         scoring="neg_root_mean_squared_error",
         random_state=42, n_jobs=-1, verbose=0
     )
@@ -187,52 +173,41 @@ def train_xgboost(X_train, y_train, X_test, y_test):
     model = search.best_estimator_
     print(f"Best XGB params: {search.best_params_}")
 
-    preds = model.predict(X_test)
-    preds = np.clip(preds, 0, 500)
+    preds = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "XGBoost")
-
     return {"model": model, "scaler": None, "metrics": metrics, "name": "xgboost"}
 
 
-# Train LSTM
-
 def train_lstm(X_train, y_train, X_test, y_test):
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
 
-    X_train_r = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
-    X_test_r = X_test_scaled.reshape((X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
+    X_train_r = X_train_s.reshape((X_train_s.shape[0], 1, X_train_s.shape[1]))
+    X_test_r = X_test_s.reshape((X_test_s.shape[0], 1, X_test_s.shape[1]))
 
     model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(1, X_train_scaled.shape[1])),
+        LSTM(64, return_sequences=True, input_shape=(1, X_train_s.shape[1])),
         Dropout(0.2),
         LSTM(32),
         Dropout(0.2),
         Dense(16, activation="relu"),
         Dense(1)
     ])
-
     model.compile(optimizer="adam", loss="mse")
-    early_stop = EarlyStopping(patience=5, restore_best_weights=True)
-
     model.fit(
         X_train_r, y_train,
         validation_split=0.1,
         epochs=50,
         batch_size=32,
-        callbacks=[early_stop],
+        callbacks=[EarlyStopping(patience=5, restore_best_weights=True)],
         verbose=0
     )
 
-    preds = model.predict(X_test_r).flatten()
-    preds = np.clip(preds, 0, 500)
+    preds = np.clip(model.predict(X_test_r).flatten(), 0, 500)
     metrics = evaluate(y_test, preds, "LSTM")
-
     return {"model": model, "scaler": scaler, "metrics": metrics, "name": "lstm"}
 
-
-# Save best model to MongoDB GridFS
 
 def save_model(best, feature_cols, db):
     fs = gridfs.GridFS(db)
@@ -241,7 +216,7 @@ def save_model(best, feature_cols, db):
         "model": best["model"],
         "scaler": best["scaler"],
         "feature_cols": feature_cols,
-        "is_arima": False
+        "forecast_horizon": FORECAST_HORIZON,
     }
 
     model_bytes = pickle.dumps(artifact)
@@ -264,12 +239,14 @@ def save_model(best, feature_cols, db):
             "gridfs_id": gridfs_id,
             "metrics": best["metrics"],
             "feature_cols": feature_cols,
+            "forecast_horizon": FORECAST_HORIZON,
             "trained_at": datetime.now(timezone.utc),
             "is_best": True
         }},
         upsert=True
     )
 
+    # Mark all other models as not best
     db[MODELS_COLLECTION].update_many(
         {"name": {"$ne": model_name}},
         {"$set": {"is_best": False}}
@@ -278,63 +255,48 @@ def save_model(best, feature_cols, db):
     print(f"Saved best model: {model_name}")
 
 
-# Log metrics for all models
-
 def log_metrics(results, db):
-    collection = db[METRICS_COLLECTION]
     timestamp = datetime.now(timezone.utc)
     for result in results:
-        collection.insert_one({
+        db[METRICS_COLLECTION].insert_one({
             "model_name": result["name"],
             "metrics": result["metrics"],
             "logged_at": timestamp
         })
 
 
-# Main training pipeline
-
 def run_training_pipeline():
     print("Starting training pipeline...")
     db = get_db()
 
     df = load_features(db)
-
     if len(df) < 100:
         print("Not enough data to train. Run backfill first.")
         return
 
-    X, y, feature_cols = build_features_and_target(df, forecast_horizon=1)
+    X, y, feature_cols = build_features_and_target(df)
     print(f"Feature matrix: {X.shape} | Target: {y.shape}")
     print(f"Features used: {feature_cols}")
 
+    # Chronological split — never shuffle time-series data
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
 
     print("\nTraining models...")
-    ridge_result = train_ridge(X_train, y_train, X_test, y_test)
-    rf_result = train_random_forest(X_train, y_train, X_test, y_test)
-    gb_result = train_gradient_boosting(X_train, y_train, X_test, y_test)
-    xgb_result = train_xgboost(X_train, y_train, X_test, y_test)
-    lstm_result = train_lstm(X_train, y_train, X_test, y_test)
-
-    results = [ridge_result, rf_result, gb_result, xgb_result, lstm_result]
+    results = [
+        train_ridge(X_train, y_train, X_test, y_test),
+        train_random_forest(X_train, y_train, X_test, y_test),
+        train_gradient_boosting(X_train, y_train, X_test, y_test),
+        train_xgboost(X_train, y_train, X_test, y_test),
+        train_lstm(X_train, y_train, X_test, y_test),
+    ]
 
     best = min(results, key=lambda r: r["metrics"]["rmse"])
     print(f"\nBest model: {best['name']} (RMSE: {best['metrics']['rmse']})")
 
     save_model(best, feature_cols, db)
     log_metrics(results, db)
-
-    for result in results:
-        db[MODELS_COLLECTION].update_one(
-            {"name": f"aqi_{result['name']}_model"},
-            {"$set": {
-                "trained_at": datetime.now(timezone.utc),
-                "metrics": result["metrics"]
-            }},
-            upsert=True
-        )
 
     print("Training pipeline complete.")
 

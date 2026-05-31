@@ -50,7 +50,62 @@ def fetch_current_data():
 
     return aq_data, w_data
 
+def fetch_forecast_data():
+    # Air quality forecast (4 days)
+    aq_params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "hourly": AIR_QUALITY_PARAMS,
+        "timezone": "Asia/Karachi",
+        "forecast_days": 4
+    }
+    aq_response = requests.get(OPENMETEO_AIR_QUALITY_URL, params=aq_params)
+    aq_response.raise_for_status()
+    aq_data = aq_response.json()
 
+    # Weather forecast (4 days)
+    w_params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "hourly": WEATHER_PARAMS,
+        "timezone": "Asia/Karachi",
+        "forecast_days": 4
+    }
+    w_response = requests.get(OPENMETEO_WEATHER_URL, params=w_params)
+    w_response.raise_for_status()
+    w_data = w_response.json()
+
+    # Build a dict of time -> features for next 72 hours
+    now = datetime.now(timezone.utc)
+    forecast_features = {}
+
+    aq_hourly = aq_data["hourly"]
+    w_hourly = w_data["hourly"]
+    w_time_map = {t: i for i, t in enumerate(w_hourly["time"])}
+
+    for i, time_str in enumerate(aq_hourly["time"]):
+        dt = datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc)
+        if dt <= now:
+            continue
+        hours_ahead = int((dt - now).total_seconds() / 3600)
+        if hours_ahead > 72:
+            break
+
+        w_idx = w_time_map.get(time_str, 0)
+        forecast_features[hours_ahead] = {
+            "pm2_5": aq_hourly["pm2_5"][i] or 0,
+            "pm10": aq_hourly["pm10"][i] or 0,
+            "no2": aq_hourly["nitrogen_dioxide"][i] or 0,
+            "o3": aq_hourly["ozone"][i] or 0,
+            "co": aq_hourly["carbon_monoxide"][i] or 0,
+            "so2": aq_hourly["sulphur_dioxide"][i] or 0,
+            "temperature": w_hourly["temperature_2m"][w_idx] or 0,
+            "humidity": w_hourly["relative_humidity_2m"][w_idx] or 0,
+            "pressure": w_hourly["surface_pressure"][w_idx] or 0,
+            "wind_speed": w_hourly["wind_speed_10m"][w_idx] or 0,
+        }
+
+    return forecast_features
 # Parse current hour data from API response
 
 def parse_current_hour(aq_data, w_data):
@@ -181,6 +236,18 @@ def run_feature_pipeline():
     record = parse_current_hour(aq_data, w_data)
     record = compute_features(record, db)
     store_features(record, db)
+
+    # Also fetch and store forecast features for use in predictions
+    forecast_features = fetch_forecast_data()
+    db["forecast_features"].replace_one(
+        {"city": CITY},
+        {
+            "city": CITY,
+            "updated_at": datetime.now(timezone.utc),
+            "forecasts": {str(k): v for k, v in forecast_features.items()}
+        },
+        upsert=True
+    )
 
     print("Feature pipeline complete!")
     return record
