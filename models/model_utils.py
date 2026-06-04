@@ -17,8 +17,7 @@ from config.settings import (
     LAG_HOURS, ROLLING_WINDOWS
 )
 
-# Total hours to forecast: 3 days = 72 steps of 1h each
-FORECAST_STEPS = 72
+FORECAST_STEPS = 72  # 3 days × 24 hours
 
 
 def get_db():
@@ -33,190 +32,173 @@ def get_db():
 def load_best_model(db=None):
     if db is None:
         db = get_db()
-
     fs = gridfs.GridFS(db)
     model_doc = db[MODELS_COLLECTION].find_one({"is_best": True})
-
     if not model_doc:
-        raise ValueError("No best model found in MongoDB. Run training pipeline first.")
-
-    model_bytes = fs.get(model_doc["gridfs_id"]).read()
-    artifact = pickle.loads(model_bytes)
+        raise ValueError("No best model found. Run training pipeline first.")
+    artifact = pickle.loads(fs.get(model_doc["gridfs_id"]).read())
     return artifact, model_doc
 
 
 # ---------------------------------------------------------------------------
-# Feature loading from MongoDB
+# Feature loading
 # ---------------------------------------------------------------------------
 
 def load_latest_features(feature_cols, db=None, n=50):
-    """Load the n most recent feature rows from MongoDB."""
     if db is None:
         db = get_db()
-
     records = list(db[FEATURES_COLLECTION].find(
         {}, sort=[("timestamp", -1)], limit=n
     ))
-
     if not records:
-        raise ValueError("No features found in MongoDB. Run feature pipeline first.")
-
+        raise ValueError("No features in MongoDB. Run feature pipeline first.")
     df = pd.DataFrame(records)
     df = df.sort_values("timestamp").reset_index(drop=True)
-
+    # Add derived features so the row matches training schema
+    df = _add_inference_features(df)
     for col in feature_cols:
         if col not in df.columns:
-            df[col] = 0
-
+            df[col] = 0.0
     return df[feature_cols].values, df
 
 
+def _add_inference_features(df):
+    """
+    Mirror of add_features() in training_pipeline — must stay in sync.
+    Any feature added to training must also be computed here.
+    """
+    df = df.copy()
+
+    # Log transforms
+    for col in ["pm2_5", "pm10", "no2", "co", "so2"]:
+        if col in df.columns:
+            df[f"log_{col}"] = np.log1p(df[col])
+
+    # Wind interactions
+    df["pm2_5_x_wind"] = df["pm2_5"] / (df["wind_speed"] + 1)
+    df["pm10_x_wind"]  = df["pm10"]  / (df["wind_speed"] + 1)
+
+    # Momentum
+    if "aqi_lag_3h" in df.columns:
+        df["aqi_momentum_3h"] = (df["aqi"] - df["aqi_lag_3h"]) / 3.0
+    else:
+        df["aqi_momentum_3h"] = 0.0
+    if "aqi_lag_6h" in df.columns:
+        df["aqi_momentum_6h"] = (df["aqi"] - df["aqi_lag_6h"]) / 6.0
+    else:
+        df["aqi_momentum_6h"] = 0.0
+
+    # lag_48h
+    df["aqi_lag_48h"] = df["aqi"].shift(48) if len(df) > 48 else df["aqi"]
+
+    # Peak traffic hour flag
+    df["peak_traffic_hour"] = df["hour"].between(15, 20).astype(int)
+
+    # Rolling volatility
+    df["aqi_std_6h"] = (
+        df["aqi"].shift(1).rolling(window=6, min_periods=2).std().round(3)
+    )
+    df["aqi_std_6h"] = df["aqi_std_6h"].fillna(0.0)
+
+    # Cyclical time
+    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]  / 24)
+    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]  / 24)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+
+    return df
+
+
 # ---------------------------------------------------------------------------
-# Fetch 3-day weather + air quality forecast from Open-Meteo
+# 3-day weather forecast from Open-Meteo
 # ---------------------------------------------------------------------------
 
 def fetch_weather_forecast():
-    """
-    Returns a DataFrame indexed by timestamp with hourly forecasted values
-    for the next 3 days (72 rows minimum).
-
-    Columns: timestamp, pm2_5, pm10, no2, o3, co, so2,
-             temperature, humidity, pressure, wind_speed
-    """
     aq_params = {
-        "latitude": LAT,
-        "longitude": LON,
+        "latitude": LAT, "longitude": LON,
         "hourly": "pm2_5,pm10,nitrogen_dioxide,ozone,carbon_monoxide,sulphur_dioxide",
-        "timezone": "Asia/Karachi",
-        "forecast_days": 4,   # fetch 4 days so we always have 72+ hours
+        "timezone": "Asia/Karachi", "forecast_days": 4,
     }
     w_params = {
-        "latitude": LAT,
-        "longitude": LON,
+        "latitude": LAT, "longitude": LON,
         "hourly": "temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m",
-        "timezone": "Asia/Karachi",
-        "forecast_days": 4,
+        "timezone": "Asia/Karachi", "forecast_days": 4,
     }
-
     try:
-        aq_resp = requests.get(OPENMETEO_AIR_QUALITY_URL, params=aq_params, timeout=10)
-        aq_resp.raise_for_status()
-        aq = aq_resp.json()["hourly"]
-
-        w_resp = requests.get(OPENMETEO_WEATHER_URL, params=w_params, timeout=10)
-        w_resp.raise_for_status()
-        w = w_resp.json()["hourly"]
-
-        # Build a time-indexed dict for fast lookup
+        aq = requests.get(OPENMETEO_AIR_QUALITY_URL, params=aq_params, timeout=10).json()["hourly"]
+        w  = requests.get(OPENMETEO_WEATHER_URL,     params=w_params,  timeout=10).json()["hourly"]
         w_map = {t: i for i, t in enumerate(w["time"])}
-
         rows = []
         for i, t in enumerate(aq["time"]):
             wi = w_map.get(t, 0)
             rows.append({
-                "timestamp": t,   # string like "2025-06-01T14:00"
-                "pm2_5":        float(aq["pm2_5"][i] or 0),
-                "pm10":         float(aq["pm10"][i] or 0),
-                "no2":          float(aq["nitrogen_dioxide"][i] or 0),
-                "o3":           float(aq["ozone"][i] or 0),
-                "co":           float(aq["carbon_monoxide"][i] or 0),
-                "so2":          float(aq["sulphur_dioxide"][i] or 0),
-                "temperature":  float(w["temperature_2m"][wi] or 0),
-                "humidity":     float(w["relative_humidity_2m"][wi] or 0),
-                "pressure":     float(w["surface_pressure"][wi] or 0),
-                "wind_speed":   float(w["wind_speed_10m"][wi] or 0),
+                "timestamp":   t,
+                "pm2_5":       float(aq["pm2_5"][i] or 0),
+                "pm10":        float(aq["pm10"][i] or 0),
+                "no2":         float(aq["nitrogen_dioxide"][i] or 0),
+                "o3":          float(aq["ozone"][i] or 0),
+                "co":          float(aq["carbon_monoxide"][i] or 0),
+                "so2":         float(aq["sulphur_dioxide"][i] or 0),
+                "temperature": float(w["temperature_2m"][wi] or 0),
+                "humidity":    float(w["relative_humidity_2m"][wi] or 0),
+                "pressure":    float(w["surface_pressure"][wi] or 0),
+                "wind_speed":  float(w["wind_speed_10m"][wi] or 0),
             })
-
-        df = pd.DataFrame(rows)
-        return df
-
+        return pd.DataFrame(rows)
     except Exception as e:
-        print(f"Warning: could not fetch weather forecast ({e}). "
-              "Weather features will be held constant.")
+        print(f"Warning: weather forecast fetch failed ({e}). "
+              "Weather features held constant.")
         return None
 
 
 def _lookup_weather(forecast_df, target_dt):
-    """
-    Given the forecast DataFrame, return the weather row closest to target_dt.
-    target_dt must be timezone-aware or naive (both sides treated as UTC).
-    """
     if forecast_df is None or forecast_df.empty:
         return None
-
-    # Build the key string the same way Open-Meteo formats it
     key = target_dt.strftime("%Y-%m-%dT%H:00")
     row = forecast_df[forecast_df["timestamp"] == key]
-
     if row.empty:
-        # Fallback: pick the nearest available hour
         try:
             times = pd.to_datetime(forecast_df["timestamp"])
-            target_naive = pd.Timestamp(target_dt).tz_localize(None) \
-                if target_dt.tzinfo else pd.Timestamp(target_dt)
-            idx = (times - target_naive).abs().argmin()
-            row = forecast_df.iloc[[idx]]
+            naive = pd.Timestamp(target_dt).tz_localize(None) \
+                    if target_dt.tzinfo else pd.Timestamp(target_dt)
+            row = forecast_df.iloc[[(times - naive).abs().argmin()]]
         except Exception:
             return None
-
     return row.iloc[0]
 
 
 # ---------------------------------------------------------------------------
-# Single-step prediction
+# Single prediction step
 # ---------------------------------------------------------------------------
 
 def _predict_one(artifact, row_values):
-    """
-    Run one inference step.
-    row_values: 1-D numpy array of shape (n_features,)
-    Returns a scalar float AQI prediction.
-    """
-    model = artifact["model"]
+    model  = artifact["model"]
     scaler = artifact["scaler"]
-
     X = row_values.reshape(1, -1)
-
     if scaler is not None:
         X = scaler.transform(X)
-
-    model_type = type(model).__name__
-    if model_type == "Sequential":
+    if type(model).__name__ == "Sequential":
         X = X.reshape((1, 1, X.shape[1]))
         pred = float(model.predict(X, verbose=0).flatten()[0])
     else:
         pred = float(model.predict(X)[0])
-
-    return max(0.0, min(500.0, pred))
+    return max(0.0, min(400.0, round(pred, 2)))
 
 
 # ---------------------------------------------------------------------------
-# 72-step iterative forecast  (THE CORE FIX)
+# 72-step iterative forecast
 # ---------------------------------------------------------------------------
+
+def _set(row, feature_cols, col, value):
+    if col in feature_cols:
+        row[feature_cols.index(col)] = float(value)
+
 
 def generate_forecast(artifact, latest_features_df, feature_cols):
-    """
-    Produce 72 hourly AQI forecasts (3 days ahead) by calling the 1-hour
-    model iteratively.
+    weather_df   = fetch_weather_forecast()
+    aqi_history  = list(latest_features_df["aqi"].values[-24:])
+    base_row     = latest_features_df[feature_cols].values[-1].copy().astype(float)
 
-    At each step we:
-      1. Update time features (hour, day_of_week, month).
-      2. Update weather / pollutant features from Open-Meteo's 3-day forecast.
-      3. Update AQI lag and rolling features using the growing prediction history.
-      4. Run the model, collect the predicted AQI.
-      5. Append that prediction to the history for the next step.
-    """
-    # --- Fetch the 3-day weather forecast once up front ---
-    weather_df = fetch_weather_forecast()
-
-    # --- Seed history with observed AQI values ---
-    # We need up to 24 values for aqi_lag_24h / aqi_rolling_24h
-    aqi_history = list(latest_features_df["aqi"].values[-24:])
-
-    # --- Base row (last known observation) ---
-    base_row = latest_features_df[feature_cols].values[-1].copy().astype(float)
-
-    # --- Base timestamp ---
     try:
         base_time = pd.to_datetime(latest_features_df["timestamp"].iloc[-1])
         if base_time.tzinfo is None:
@@ -227,52 +209,79 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
     forecasts = []
 
     for step in range(1, FORECAST_STEPS + 1):
-        row = base_row.copy()
+        row         = base_row.copy()
         future_time = base_time + timedelta(hours=step)
 
-        # --- 1. Time features ---
-        _set(row, feature_cols, "hour",        future_time.hour)
-        _set(row, feature_cols, "day_of_week", future_time.weekday())
-        _set(row, feature_cols, "month",       future_time.month)
-
-        # --- 2. Forecasted weather / pollutant features ---
-        weather_row = _lookup_weather(weather_df, future_time)
-        if weather_row is not None:
+        # --- 1. Forecasted weather / pollutants ---
+        wr = _lookup_weather(weather_df, future_time)
+        if wr is not None:
+            raw = {}
             for col in ["pm2_5", "pm10", "no2", "o3", "co", "so2",
                         "temperature", "humidity", "pressure", "wind_speed"]:
-                if col in weather_row and col in feature_cols:
-                    _set(row, feature_cols, col, float(weather_row[col]))
+                if col in wr:
+                    raw[col] = float(wr[col])
+                    _set(row, feature_cols, col, raw[col])
 
-        # --- 3. AQI lag features (from growing history) ---
+            # Derived features from forecasted weather
+            pm25 = raw.get("pm2_5", 0)
+            pm10 = raw.get("pm10",  0)
+            hum  = raw.get("humidity",   0)
+            wind = raw.get("wind_speed", 0)
+            _set(row, feature_cols, "pm2_5_x_humidity", pm25 * hum / 100)
+            _set(row, feature_cols, "pm10_x_humidity",  pm10 * hum / 100)
+            _set(row, feature_cols, "pm2_5_x_wind",     pm25 / (wind + 1))
+            _set(row, feature_cols, "pm10_x_wind",      pm10 / (wind + 1))
+            _set(row, feature_cols, "log_pm2_5", np.log1p(pm25))
+            _set(row, feature_cols, "log_pm10",  np.log1p(pm10))
+            _set(row, feature_cols, "log_co",    np.log1p(raw.get("co",  0)))
+            _set(row, feature_cols, "log_so2",   np.log1p(raw.get("so2", 0)))
+
+        # --- 2. Cyclical time features ---
+        _set(row, feature_cols, "hour_sin",  np.sin(2 * np.pi * future_time.hour     / 24))
+        _set(row, feature_cols, "hour_cos",  np.cos(2 * np.pi * future_time.hour     / 24))
+        _set(row, feature_cols, "month_sin", np.sin(2 * np.pi * future_time.month    / 12))
+        _set(row, feature_cols, "month_cos", np.cos(2 * np.pi * future_time.month    / 12))
+        _set(row, feature_cols, "day_of_week", future_time.weekday())
+
+        # --- 3. AQI lag features ---
         for lag in LAG_HOURS:
-            col = f"aqi_lag_{lag}h"
-            if col in feature_cols and len(aqi_history) >= lag:
-                _set(row, feature_cols, col, aqi_history[-lag])
+            if len(aqi_history) >= lag:
+                _set(row, feature_cols, f"aqi_lag_{lag}h", aqi_history[-lag])
 
         # --- 4. AQI rolling features ---
         for window in ROLLING_WINDOWS:
-            col = f"aqi_rolling_{window}h"
-            if col in feature_cols and len(aqi_history) >= 1:
-                window_vals = aqi_history[-window:]   # as many as available
-                _set(row, feature_cols, col, round(sum(window_vals) / len(window_vals), 2))
+            vals = aqi_history[-window:]
+            if vals:
+                _set(row, feature_cols, f"aqi_rolling_{window}h",
+                     round(sum(vals) / len(vals), 2))
 
-        # --- 5. AQI change rate ---
-        if "aqi_change_rate" in feature_cols and len(aqi_history) >= 2:
+        # --- 5. AQI momentum, volatility, peak hour, lag_48h ---
+        if len(aqi_history) >= 2:
             prev = aqi_history[-2]
             curr = aqi_history[-1]
             _set(row, feature_cols, "aqi_change_rate",
                  round((curr - prev) / max(abs(prev), 1), 4))
+        if len(aqi_history) >= 3:
+            _set(row, feature_cols, "aqi_momentum_3h",
+                 round((aqi_history[-1] - aqi_history[-3]) / 3.0, 4))
+        if len(aqi_history) >= 6:
+            _set(row, feature_cols, "aqi_momentum_6h",
+                 round((aqi_history[-1] - aqi_history[-6]) / 6.0, 4))
+            _set(row, feature_cols, "aqi_std_6h",
+                 round(float(np.std(aqi_history[-6:])), 3))
+        if len(aqi_history) >= 48:
+            _set(row, feature_cols, "aqi_lag_48h", aqi_history[-48])
+        _set(row, feature_cols, "peak_traffic_hour",
+             1 if 15 <= future_time.hour <= 20 else 0)
 
         # --- 6. Predict ---
         predicted_aqi = _predict_one(artifact, row)
-
         forecasts.append({
-            "horizon_hours":  step,
-            "predicted_aqi":  round(predicted_aqi, 2),
-            "forecast_time":  future_time.isoformat(),
+            "horizon_hours": step,
+            "predicted_aqi": predicted_aqi,
+            "forecast_time": future_time.isoformat(),
         })
 
-        # Append prediction to history for next step's lag features
         aqi_history.append(predicted_aqi)
         if len(aqi_history) > 24:
             aqi_history = aqi_history[-24:]
@@ -280,52 +289,51 @@ def generate_forecast(artifact, latest_features_df, feature_cols):
     return forecasts
 
 
-def _set(row, feature_cols, col, value):
-    """Helper: set a value in the row array by column name."""
-    if col in feature_cols:
-        row[feature_cols.index(col)] = value
-
-
 # ---------------------------------------------------------------------------
 # SHAP
 # ---------------------------------------------------------------------------
 
 def generate_shap_values(artifact, X, feature_cols, background_X=None):
-    model = artifact["model"]
-    scaler = artifact["scaler"]
+    model      = artifact["model"]
+    scaler     = artifact["scaler"]
     model_type = type(model).__name__
 
     if scaler is not None:
         X_input = scaler.transform(X)
-        bg_input = scaler.transform(background_X) if background_X is not None else X_input
+        bg      = scaler.transform(background_X) if background_X is not None else X_input
     else:
         X_input = X
-        bg_input = background_X if background_X is not None else X_input
+        bg      = background_X if background_X is not None else X_input
 
     shap_values = None
-
     try:
-        if model_type in ["RandomForestRegressor", "XGBRegressor", "GradientBoostingRegressor"]:
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_input)
+        if model_type in ["RandomForestRegressor", "XGBRegressor",
+                          "GradientBoostingRegressor"]:
+            shap_values = shap.TreeExplainer(model).shap_values(X_input)
         elif model_type == "Ridge":
-            explainer = shap.LinearExplainer(model, bg_input)
-            shap_values = explainer.shap_values(X_input)
-        # LSTM: skip (KernelExplainer is too slow for production)
+            shap_values = shap.LinearExplainer(model, bg).shap_values(X_input)
+        elif model_type == "StackingRegressor":
+            # Use the best base learner for SHAP (first tree-based one found)
+            for _, est in model.estimators_:
+                etype = type(est).__name__
+                if etype in ["RandomForestRegressor", "XGBRegressor",
+                             "GradientBoostingRegressor"]:
+                    shap_values = shap.TreeExplainer(est).shap_values(X_input)
+                    break
 
         if shap_values is None:
             return None, None
 
+        vals = shap_values[-1] if shap_values.ndim > 1 else shap_values[0]
         shap_df = pd.DataFrame({
-            "feature": feature_cols,
-            "shap_value": np.abs(shap_values[-1] if len(shap_values.shape) > 1
-                                 else shap_values[0])
+            "feature":    feature_cols,
+            "shap_value": np.abs(vals),
         }).sort_values("shap_value", ascending=False)
 
         return shap_values, shap_df
 
     except Exception as e:
-        print(f"SHAP generation failed: {e}")
+        print(f"SHAP failed: {e}")
         return None, None
 
 
@@ -334,18 +342,18 @@ def generate_shap_values(artifact, X, feature_cols, background_X=None):
 # ---------------------------------------------------------------------------
 
 def get_aqi_category(aqi):
-    if aqi <= 50:   return "Good"
-    if aqi <= 100:  return "Moderate"
-    if aqi <= 150:  return "Unhealthy for Sensitive Groups"
-    if aqi <= 200:  return "Unhealthy"
-    if aqi <= 300:  return "Very Unhealthy"
+    if aqi <= 50:  return "Good"
+    if aqi <= 100: return "Moderate"
+    if aqi <= 150: return "Unhealthy for Sensitive Groups"
+    if aqi <= 200: return "Unhealthy"
+    if aqi <= 300: return "Very Unhealthy"
     return "Hazardous"
 
 
 def get_aqi_color(aqi):
-    if aqi <= 50:   return "#00e400"
-    if aqi <= 100:  return "#ffff00"
-    if aqi <= 150:  return "#ff7e00"
-    if aqi <= 200:  return "#ff0000"
-    if aqi <= 300:  return "#8f3f97"
+    if aqi <= 50:  return "#00e400"
+    if aqi <= 100: return "#ffff00"
+    if aqi <= 150: return "#ff7e00"
+    if aqi <= 200: return "#ff0000"
+    if aqi <= 300: return "#8f3f97"
     return "#7e0023"
