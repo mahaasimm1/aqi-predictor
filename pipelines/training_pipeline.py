@@ -54,22 +54,7 @@ def clean_data(df):
 
 
 def add_features(df):
-    """
-    Three targeted additions vs previous version:
-
-    1. lag_48h  — same hour yesterday-yesterday. Autocorr at lag_48h = 0.31
-       (from EDA), weaker than lag_24h but adds genuine signal for 2-day cycles.
-
-    2. peak_traffic_hour — binary flag for hours 15-20. EDA residuals showed
-       systematic under-prediction during evening rush (residual mean +2.97 at
-       hour 17). Giving the model an explicit handle on this pattern lets it
-       correct for it directly.
-
-    3. aqi_std_6h — rolling std of last 6h AQI. Captures volatility regime:
-       when AQI is stable (low std) the model should regress to rolling mean;
-       when volatile (high std) it should weight recent lags more. This is
-       something tree models can learn if the feature is explicit.
-    """
+    
     df = df.copy()
 
     # Log transforms
@@ -89,13 +74,13 @@ def add_features(df):
     if "aqi_lag_6h" in df.columns:
         df["aqi_momentum_6h"] = (df["aqi"] - df["aqi_lag_6h"]) / 6.0
 
-    # NEW 1: lag_48h (same-time two days ago)
+    # lag_48h (same-time two days ago)
     df["aqi_lag_48h"] = df["aqi"].shift(48)
 
-    # NEW 2: peak traffic hour flag (EDA showed systematic residual error)
+    # peak traffic hour flag (EDA showed systematic residual error)
     df["peak_traffic_hour"] = df["hour"].between(15, 20).astype(int)
 
-    # NEW 3: rolling volatility — std of last 6h AQI
+    # rolling volatility — std of last 6h AQI
     df["aqi_std_6h"] = (
         df["aqi"].shift(1).rolling(window=6, min_periods=2).std().round(3)
     )
@@ -148,13 +133,31 @@ def evaluate(y_true, y_pred, model_name):
 def tscv_score(model, X, y, n_splits=5):
     """
     TimeSeriesSplit cross-validation.
-    More reliable R² estimate than a single holdout split —
-    averages over 5 different train/test windows across the full timeline.
+    More reliable estimate than a single holdout split —
+    averages RMSE, MAE, and R² over 5 chronological train/test windows.
     """
-    tscv   = TimeSeriesSplit(n_splits=n_splits)
-    scores = cross_val_score(model, X, y, cv=tscv,
-                             scoring="r2", n_jobs=-1)
-    return scores.mean(), scores.std()
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    rmses, maes, r2s = [], [], []
+    for train_idx, test_idx in tscv.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        model.fit(X_tr, y_tr)
+        preds = np.clip(model.predict(X_te), 0, 500)
+
+        rmses.append(np.sqrt(mean_squared_error(y_te, preds)))
+        maes.append(mean_absolute_error(y_te, preds))
+        r2s.append(r2_score(y_te, preds))
+
+    return {
+        "rmse": round(float(np.mean(rmses)), 4),
+        "mae":  round(float(np.mean(maes)),  4),
+        "r2":   round(float(np.mean(r2s)),   4),
+        "rmse_std": round(float(np.std(rmses)), 4),
+        "mae_std":  round(float(np.std(maes)),  4),
+        "r2_std":   round(float(np.std(r2s)),   4),
+    }
 
 
 def train_ridge(X_train, y_train, X_test, y_test):
@@ -191,10 +194,13 @@ def train_random_forest(X_train, y_train, X_test, y_test):
     metrics = evaluate(y_test, preds, "RandomForest")
 
     # TimeSeriesSplit CV score on full dataset
-    r2_cv, r2_std = tscv_score(model, np.vstack([X_train, X_test]),
-                                np.concatenate([y_train, y_test]))
-    print(f"    RF TimeSeriesCV R2: {r2_cv:.4f} ± {r2_std:.4f}")
-    metrics["r2_cv"] = round(r2_cv, 4)
+    cv = tscv_score(model, np.vstack([X_train, X_test]),
+                        np.concatenate([y_train, y_test]))
+    print(f"    RF  CV  RMSE={cv['rmse']} ± {cv['rmse_std']}  "
+          f"MAE={cv['mae']} ± {cv['mae_std']}  R2={cv['r2']} ± {cv['r2_std']}")
+    metrics["rmse_cv"] = cv["rmse"]
+    metrics["mae_cv"]  = cv["mae"]
+    metrics["r2_cv"]   = cv["r2"]
 
     return {"model": model, "scaler": None, "metrics": metrics, "name": "random_forest"}
 
@@ -216,10 +222,13 @@ def train_extra_trees(X_train, y_train, X_test, y_test):
     print(f"    ET: {search.best_params_}")
     preds  = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "ExtraTrees")
-    r2_cv, r2_std = tscv_score(model, np.vstack([X_train, X_test]),
-                                np.concatenate([y_train, y_test]))
-    print(f"    ET  TimeSeriesCV R2: {r2_cv:.4f} ± {r2_std:.4f}")
-    metrics["r2_cv"] = round(r2_cv, 4)
+    cv = tscv_score(model, np.vstack([X_train, X_test]),
+                        np.concatenate([y_train, y_test]))
+    print(f"    ET  CV  RMSE={cv['rmse']} ± {cv['rmse_std']}  "
+          f"MAE={cv['mae']} ± {cv['mae_std']}  R2={cv['r2']} ± {cv['r2_std']}")
+    metrics["rmse_cv"] = cv["rmse"]
+    metrics["mae_cv"]  = cv["mae"]
+    metrics["r2_cv"]   = cv["r2"]
     return {"model": model, "scaler": None, "metrics": metrics, "name": "extra_trees"}
 
 
@@ -244,10 +253,13 @@ def train_xgboost(X_train, y_train, X_test, y_test):
     print(f"    XGB: {search.best_params_}")
     preds  = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "XGBoost")
-    r2_cv, r2_std = tscv_score(model, np.vstack([X_train, X_test]),
-                                np.concatenate([y_train, y_test]))
-    print(f"    XGB TimeSeriesCV R2: {r2_cv:.4f} ± {r2_std:.4f}")
-    metrics["r2_cv"] = round(r2_cv, 4)
+    cv = tscv_score(model, np.vstack([X_train, X_test]),
+                        np.concatenate([y_train, y_test]))
+    print(f"    XGB CV  RMSE={cv['rmse']} ± {cv['rmse_std']}  "
+          f"MAE={cv['mae']} ± {cv['mae_std']}  R2={cv['r2']} ± {cv['r2_std']}")
+    metrics["rmse_cv"] = cv["rmse"]
+    metrics["mae_cv"]  = cv["mae"]
+    metrics["r2_cv"]   = cv["r2"]
     return {"model": model, "scaler": None, "metrics": metrics, "name": "xgboost"}
 
 
@@ -268,17 +280,18 @@ def train_gradient_boosting(X_train, y_train, X_test, y_test):
     print(f"    GB: {search.best_params_}")
     preds  = np.clip(model.predict(X_test), 0, 500)
     metrics = evaluate(y_test, preds, "GradientBoosting")
-    r2_cv, r2_std = tscv_score(model, np.vstack([X_train, X_test]),
-                                np.concatenate([y_train, y_test]))
-    print(f"    GB  TimeSeriesCV R2: {r2_cv:.4f} ± {r2_std:.4f}")
-    metrics["r2_cv"] = round(r2_cv, 4)
+    cv = tscv_score(model, np.vstack([X_train, X_test]),
+                        np.concatenate([y_train, y_test]))
+    print(f"    GB  CV  RMSE={cv['rmse']} ± {cv['rmse_std']}  "
+          f"MAE={cv['mae']} ± {cv['mae_std']}  R2={cv['r2']} ± {cv['r2_std']}")
+    metrics["rmse_cv"] = cv["rmse"]
+    metrics["mae_cv"]  = cv["mae"]
+    metrics["r2_cv"]   = cv["r2"]
     return {"model": model, "scaler": None, "metrics": metrics, "name": "gradient_boosting"}
 
 
 def train_stacking(X_train, y_train, X_test, y_test,
                    rf_result, et_result, gb_result):
-    # cv must be an integer for StackingRegressor — TimeSeriesSplit causes
-    # cross_val_predict partition error in this sklearn version
     stack = StackingRegressor(
         estimators=[
             ("rf", rf_result["model"]),
@@ -298,9 +311,12 @@ def train_stacking(X_train, y_train, X_test, y_test,
     tscv = TimeSeriesSplit(n_splits=5)
     X_all = np.vstack([X_train, X_test])
     y_all = np.concatenate([y_train, y_test])
-    r2_scores = cross_val_score(stack, X_all, y_all, cv=tscv, scoring="r2", n_jobs=1)
-    print(f"    Stack TimeSeriesCV R2: {r2_scores.mean():.4f} ± {r2_scores.std():.4f}")
-    metrics["r2_cv"] = round(r2_scores.mean(), 4)
+    cv = tscv_score(stack, X_all, y_all)
+    print(f"    Stack CV  RMSE={cv['rmse']} ± {cv['rmse_std']}  "
+          f"MAE={cv['mae']} ± {cv['mae_std']}  R2={cv['r2']} ± {cv['r2_std']}")
+    metrics["rmse_cv"] = cv["rmse"]
+    metrics["mae_cv"]  = cv["mae"]
+    metrics["r2_cv"]   = cv["r2"]
 
     return {"model": stack, "scaler": None, "metrics": metrics, "name": "stacking"}
 
@@ -328,7 +344,12 @@ def save_model(best, feature_cols, db):
             "name":             model_name,
             "model_type":       best["name"],
             "gridfs_id":        gridfs_id,
-            "metrics":          best["metrics"],
+            "metrics":          best["metrics"],   # holdout metrics
+            "metrics_cv": {                        # TimeSeriesCV metrics
+                "rmse": best["metrics"].get("rmse_cv"),
+                "mae":  best["metrics"].get("mae_cv"),
+                "r2":   best["metrics"].get("r2_cv"),
+            },
             "feature_cols":     feature_cols,
             "forecast_horizon": FORECAST_HORIZON,
             "trained_at":       datetime.now(timezone.utc),
@@ -355,7 +376,7 @@ def log_metrics(results, db):
 
 def run_training_pipeline():
     print("=" * 60)
-    print("Training pipeline — with TimeSeriesCV + new features")
+    print("Training pipeline")
     print("=" * 60)
     db = get_db()
 
@@ -364,10 +385,10 @@ def run_training_pipeline():
         print("Not enough data.")
         return
 
-    print("\n--- Cleaning ---")
+    print("\nCleaning")
     df = clean_data(df)
 
-    print("\n--- Feature engineering ---")
+    print("\nFeature engineering")
     df = add_features(df)
 
     print("\n--- Building feature matrix ---")
@@ -379,14 +400,14 @@ def run_training_pipeline():
     X_test  = X[split:];  y_test  = y[split:]
     print(f"  Train={len(X_train)}, Test={len(X_test)}\n")
 
-    print("--- Training (TimeSeriesCV hyperparameter search) ---")
+    print("Training (TimeSeriesCV hyperparameter search)")
     ridge_r = train_ridge(X_train, y_train, X_test, y_test)
     rf_r    = train_random_forest(X_train, y_train, X_test, y_test)
     et_r    = train_extra_trees(X_train, y_train, X_test, y_test)
     xgb_r   = train_xgboost(X_train, y_train, X_test, y_test)
     gb_r    = train_gradient_boosting(X_train, y_train, X_test, y_test)
 
-    print("\n--- Stacking ---")
+    print("\nStacking")
     stack_r = train_stacking(X_train, y_train, X_test, y_test,
                              rf_r, et_r, gb_r)
 
@@ -401,16 +422,25 @@ def run_training_pipeline():
     best = min(results, key=sort_key)
 
     print(f"\n{'='*60}")
-    print(f"All model results:")
+    print(f"All model results (holdout | TimeSeriesCV):")
+    print(f"  {'Model':20s}  {'RMSE':>8}  {'MAE':>8}  {'R2':>8}  "
+          f"{'CV_RMSE':>10}  {'CV_MAE':>8}  {'CV_R2':>8}")
+    print(f"  {'-'*80}")
     for r in results:
-        cv = f"  CV_R2={r['metrics'].get('r2_cv','n/a')}" if "r2_cv" in r["metrics"] else ""
-        print(f"  {r['name']:20s}  RMSE={r['metrics']['rmse']}  R2={r['metrics']['r2']}{cv}")
+        m = r["metrics"]
+        cv_str = (f"  {m.get('rmse_cv','n/a'):>10}  {m.get('mae_cv','n/a'):>8}  {m.get('r2_cv','n/a'):>8}"
+                  if "r2_cv" in m else "  n/a")
+        print(f"  {r['name']:20s}  {m['rmse']:>8}  {m['mae']:>8}  {m['r2']:>8}{cv_str}")
     print(f"\nWinner : {best['name']}")
-    print(f"RMSE   : {best['metrics']['rmse']}")
-    print(f"MAE    : {best['metrics']['mae']}")
-    print(f"R2     : {best['metrics']['r2']}")
+    print(f"Holdout")
+    print(f"  RMSE : {best['metrics']['rmse']}")
+    print(f"  MAE  : {best['metrics']['mae']}")
+    print(f"  R2   : {best['metrics']['r2']}")
     if "r2_cv" in best["metrics"]:
-        print(f"R2(CV) : {best['metrics']['r2_cv']}  ← evaluated across 5 time windows")
+        print(f"TimeSeriesCV (5 folds)")
+        print(f"  RMSE : {best['metrics']['rmse_cv']}")
+        print(f"  MAE  : {best['metrics']['mae_cv']}")
+        print(f"  R2   : {best['metrics']['r2_cv']}")
     print("=" * 60)
 
     save_model(best, feature_cols, db)
