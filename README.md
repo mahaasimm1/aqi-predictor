@@ -173,13 +173,3 @@ The workflow file is at `.github/workflows/feature_pipeline.yml`.
 **EDA** (`notebooks/eda.ipynb`) — Data quality checks, AQI distribution, temporal patterns, feature correlations, pollutant distributions, lag feature analysis, weather analysis, interaction feature validation, and a full summary of findings used to drive feature engineering decisions.
 
 **SHAP Analysis** (`notebooks/shap_analysis.ipynb`) — Global feature importance, beeswarm summary plot, dependency plots for top features, waterfall explanations for individual predictions, time-of-day SHAP patterns, and feature group breakdown.
-
----
-
-## Key findings
-
-- `aqi_lag_1h` is the strongest predictor (mean |SHAP| = 9.51), consistent with hourly autocorrelation of 0.97
-- Lag and rolling features account for 73.1% of total predictive power
-- PM2.5 ranks 6th, contributing meaningful signal beyond temporal history
-- The holdout R² of 0.737 reflects an anomalous pre-monsoon test window (AQI swung 28 points in one week); the TimeSeriesCV R² of 0.876 is the more representative estimate
-- Weather features were silently zero for 75% of records due to use of the wrong Open-Meteo endpoint; fixed by switching to the archive API
